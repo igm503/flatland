@@ -5,7 +5,36 @@ import cv2
 import numpy as np
 from pynput import keyboard
 
+from ray import cast_rays
+
 EPSILON = 1e-6
+
+
+class Wall:
+    def __init__(
+        self,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        color: np.ndarray = np.full((3,), 0.2, dtype=np.float32),
+        reflectivity: float = 0.0,
+        light_intensity: float = 0.0,
+    ):
+        if x1 > x2:
+            x1, x2 = x2, x1
+            y1, y2 = y2, y1
+        self.x1 = x1
+        self.y1 = y1
+        self.x2 = x2
+        self.y2 = y2
+        self.color = color
+        self.reflectivity = reflectivity
+        self.light_intensity = light_intensity
+
+        self.m = (y2 - y1) / (x2 - x1 + EPSILON)
+        self.b = y1 - self.m * x1
+        self.angle = math.degrees(math.atan(self.m))
 
 
 class Map:
@@ -13,15 +42,62 @@ class Map:
         self.width = width
         self.height = height
         self.walls = []
-        self.image = np.full((height, width, 3), 255, dtype=np.uint8)
+        self.image = np.full((height, width, 3), 0, dtype=np.uint8)
 
-    def add_wall(self, x1: float, y1: float, x2: float, y2: float):
+        self.add_wall(
+            0,
+            0,
+            0,
+            height,
+            color=np.array([1, 1, 1]),
+            reflectivity=0.0,
+            light_intensity=1.0,
+        )
+        self.add_wall(
+            0,
+            0,
+            width,
+            0,
+            color=np.array([1, 1, 1]),
+            reflectivity=0.0,
+            light_intensity=1.0,
+        )
+        self.add_wall(
+            width,
+            0,
+            width,
+            height,
+            color=np.array([1, 1, 1]),
+            reflectivity=0.0,
+            light_intensity=1.0,
+        )
+        self.add_wall(
+            0,
+            height,
+            width,
+            height,
+            color=np.array([1, 1, 1]),
+            reflectivity=0.0,
+            light_intensity=1.0,
+        )
+
+    def add_wall(
+        self,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        color: np.ndarray = np.full((3,), 0.5, dtype=np.float32),
+        reflectivity: float = 0.0,
+        light_intensity: float = 0.0,
+    ):
         if x1 > x2:
-            wall = (x2, y2, x1, y1)
-        else:
-            wall = (x1, y1, x2, y2)
+            x1, x2 = x2, x1
+            y1, y2 = y2, y1
+        wall = Wall(x1, y1, x2, y2, color, reflectivity, light_intensity)
         self.walls.append(wall)
-        cv2.line(self.image, (x1, y1), (x2, y2), (0, 0, 0), 2)
+        wall_color = (wall.color * 255).astype(np.uint8).tolist()
+        cv2.line(self.image, (x1, y1), (x2, y2), wall_color, 4)
 
     def add_walls(self, walls: list[tuple[float, float, float, float]]):
         for x1, y1, x2, y2 in walls:
@@ -51,9 +127,8 @@ class Map:
                 raise TypeError("size must be int, tuple, or None")
 
         for player in players:
-            x, y = player.position
-            x = int(x * scale)
-            y = int(y * scale)
+            x = int(player.x * scale)
+            y = int(player.y * scale)
             cv2.circle(image, (x, y), 10, (0, 0, 255), -1)
             cv2.line(
                 image,
@@ -71,8 +146,9 @@ class Map:
 
 
 class Player:
-    def __init__(self, position: tuple[float, float], view_angle: float = 0):
-        self.position = position
+    def __init__(self, x: float, y: float, view_angle: float = 0):
+        self.x = x
+        self.y = y
         self.view_angle = view_angle
         self.health = 100
 
@@ -103,33 +179,33 @@ class Player:
     def move(self, map: Map, distance: float, direction: float):
         delta_x = math.cos(direction) * distance
         delta_y = math.sin(direction) * distance
-        new_x = self.position[0] + delta_x
-        new_y = self.position[1] + delta_y
+        new_x = self.x + delta_x
+        new_y = self.y + delta_y
         new_x = min(max(new_x, 0), map.width - 1)
         new_y = min(max(new_y, 0), map.height - 1)
 
-        if map.can_step(self.position[0], self.position[1], new_x, new_y):
-            self.position = (new_x, new_y)
+        if map.can_step(self.x, self.y, new_x, new_y):
+            self.x = new_x
+            self.y = new_y
 
 
-def intersects(line1, line2):
-    if line1[0] > line1[2]:
-        line1 = (line1[2], line1[3], line1[0], line1[1])
-    if line2[0] > line2[2]:
-        line2 = (line2[2], line2[3], line2[0], line2[1])
+def intersects(line, wall):
+    # swap point order if line is in wrong order
+    if line[0] > line[2]:
+        line = (line[2], line[3], line[0], line[1])
 
     # x disjoint?
-    if line1[0] <= line2[0]:
-        if line1[2] < line2[0]:
+    if line[0] <= wall.x1:
+        if line[2] < wall.x1:
             return False
-    elif line2[2] < line1[0]:
+    elif wall.x2 < line[0]:
         return False
 
     # y disjoint?
-    y1 = min(line1[1], line1[3])
-    y2 = max(line1[1], line1[3])
-    y3 = min(line2[1], line2[3])
-    y4 = max(line2[1], line2[3])
+    y1 = min(line[1], line[3])
+    y2 = max(line[1], line[3])
+    y3 = min(wall.y1, wall.y2)
+    y4 = max(wall.y1, wall.y2)
 
     if y1 <= y3:
         if y2 < y3:
@@ -137,32 +213,26 @@ def intersects(line1, line2):
     elif y4 < y1:
         return False
 
-    x1, y1, x2, y2 = line1
+    x1, y1, x2, y2 = line
     if x1 == x2:
         x2 += EPSILON
     m1 = (y2 - y1) / (x2 - x1)
     b1 = y1 - m1 * x1
 
-    x1, y1, x2, y2 = line2
-    if x1 == x2:
-        x2 += EPSILON
-    m2 = (y2 - y1) / (x2 - x1)
-    b2 = y1 - m2 * x1
-
-    if m1 == m2:
+    if m1 == wall.m:
         return False
 
     # m1x + b1 = m2x + b2
     # (m1 - m2)x = (b2 - b1)
     # x = (b2 - b1) / (m1 - m2)
 
-    x_intersect = (b2 - b1) / (m1 - m2)
+    x_intersect = (wall.b - b1) / (m1 - wall.m)
 
     if (
-        x_intersect >= line1[0] - EPSILON
-        and x_intersect <= line1[2] + EPSILON
-        and x_intersect >= line2[0] - EPSILON
-        and x_intersect <= line2[2] + EPSILON
+        x_intersect >= line[0] - EPSILON
+        and x_intersect <= line[2] + EPSILON
+        and x_intersect >= wall.x1 - EPSILON
+        and x_intersect <= wall.x2 + EPSILON
     ):
         return True
 
@@ -171,33 +241,37 @@ def intersects(line1, line2):
 
 if __name__ == "__main__":
     SPEED = 2.0  # units per action
-    ACTION_INTERVAL = 0.01  # seconds between actions
+    ACTION_INTERVAL = 0.001  # seconds between actions
     TURN_DEGREES = 5
 
     map = Map(1000, 1000)
-    player = Player((50, 50), 0)
+    player = Player(50, 50, 45)
 
     # Outer ring (with gap at top-left for entrance)
-    map.add_wall(100, 100, 900, 100)  # top
-    map.add_wall(900, 100, 900, 900)  # right
-    map.add_wall(900, 900, 100, 900)  # bottom
-    map.add_wall(100, 900, 100, 200)  # left (gap)
+    map.add_wall(100, 100, 900, 100, color=np.array([1, 0, 0]))  # top
+    map.add_wall(900, 100, 900, 900, color=np.array([1, 0, 0]))  # right
+    map.add_wall(900, 900, 100, 900, color=np.array([1, 0, 0]))  # bottom
+    map.add_wall(100, 900, 100, 200, color=np.array([1, 0, 0]))  # left (gap)
 
     # Second ring
-    map.add_wall(200, 200, 200, 800)  # left
-    map.add_wall(200, 800, 800, 800)  # bottom
-    map.add_wall(800, 800, 800, 200)  # right
-    map.add_wall(800, 200, 300, 200)  # top (gap)
+    map.add_wall(200, 200, 200, 800, color=np.array([0, 1, 0]))  # left
+    map.add_wall(
+        200, 800, 800, 800, color=np.array([0, 1, 0]), light_intensity=0.5
+    )  # bottom
+    map.add_wall(800, 800, 800, 200, color=np.array([0, 1, 0]))  # right
+    map.add_wall(800, 200, 300, 200, color=np.array([0, 1, 0]))  # top (gap)
 
     # Third ring
-    map.add_wall(300, 300, 700, 300)  # top
-    map.add_wall(700, 300, 700, 700)  # right
-    map.add_wall(700, 700, 300, 700)  # bottom
-    map.add_wall(300, 700, 300, 400)  # left (gap)
+    map.add_wall(300, 300, 700, 300, color=np.array([0, 0, 1]))  # top
+    map.add_wall(700, 300, 700, 700, color=np.array([0, 0, 1]))  # right
+    map.add_wall(
+        700, 700, 300, 700, color=np.array([0, 0, 1]), light_intensity=0.2
+    )  # bottom
+    map.add_wall(300, 700, 300, 400, color=np.array([0, 0, 1]))  # left (gap)
 
     # Fourth ring
     map.add_wall(400, 400, 400, 600)  # left
-    map.add_wall(400, 600, 600, 600)  # bottom
+    map.add_wall(400, 600, 600, 600, light_intensity=0.2)  # bottom
     map.add_wall(600, 600, 600, 400)  # right
     map.add_wall(600, 400, 500, 400)  # top (gap)
 
@@ -224,6 +298,9 @@ if __name__ == "__main__":
     running = True
 
     while running:
+        pixels = cast_rays(map, player)
+        pixels = cv2.resize(pixels, (1000, 20))
+        cv2.imshow("player perspective", pixels)
         cv2.imshow("land", map.get_image([player], 1000))
         key = cv2.waitKey(16) & 0xFF  # pumps the OpenCV window event loop
 
